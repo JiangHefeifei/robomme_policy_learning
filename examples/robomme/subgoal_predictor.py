@@ -6,15 +6,22 @@ import shutil
 from env_runner import EnvRunner
 from utils import EpisodeState, SUBGOAL_TYPES, TASK_WITH_VIDEO_DEMO
 
-from subgoal_prediction.gemini.api import GeminiModel
-from subgoal_prediction.gemini.prompts import (
-    DEMO_TEXT_QUERY,
-    IMAGE_TEXT_QUERY,
-    VIDEO_TEXT_QUERY,
-)
+# VLM subgoal predictors (Gemini / QwenVL / MemER) pull heavy deps (google-genai, ms_swift,
+# deepspeed). Guard these imports so memory-free baselines (pi05_baseline -> NullSubgoalPredictor)
+# can run without those packages installed. [edit for Tell-It-Once single-GPU baseline eval]
+try:
+    from subgoal_prediction.gemini.api import GeminiModel
+    from subgoal_prediction.gemini.prompts import (
+        DEMO_TEXT_QUERY,
+        IMAGE_TEXT_QUERY,
+        VIDEO_TEXT_QUERY,
+    )
 
-from subgoal_prediction.qwenvl.api import Qwen3VLModel
-from subgoal_prediction.qwenvl.api_memer import Qwen3VLModelMemER
+    from subgoal_prediction.qwenvl.api import Qwen3VLModel
+    from subgoal_prediction.qwenvl.api_memer import Qwen3VLModelMemER
+except ImportError as _vlm_import_err:  # noqa: N816
+    GeminiModel = Qwen3VLModel = Qwen3VLModelMemER = None
+    DEMO_TEXT_QUERY = IMAGE_TEXT_QUERY = VIDEO_TEXT_QUERY = None
 
 
 LONG_FIRST_ACTION_TASKS = [
