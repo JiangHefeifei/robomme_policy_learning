@@ -1,22 +1,30 @@
 """Interactive-RoboMME minimal pipeline validation.
 
-Task: ButtonUnmask (easy = 3 identical covers, 1 pick). Three conditions:
+Tasks (easy difficulty, test split):
+  ButtonUnmask  - 3 identical covers hide RGB cubes; original cue = covers lift at
+                  steps 0-64 then drop back. Utterance resolves WHERE by position:
+                  "first press the button, then pick up the middle container"
+  PickHighlight - 3 cubes, 1 target; original cue = white disk under the target at
+                  steps 10-100 then gone. Utterance resolves WHICH by color:
+                  "first press the button, then pick up the red cube"
+                  (episodes where a target color is duplicated on the table are
+                  skipped as referentially ambiguous — same seeds => same skips
+                  across conditions)
 
-  original  - covers lift at steps 0-64 as in the original benchmark (visual cue ON)
-  no_info   - covers never lift, no utterance -> guessing floor (~1/3 on easy)
-  utterance - covers never lift; at --args.utterance_step a scripted user replaces
-              the prompt with the reference resolved by table position, e.g.
-              "first press the button, then pick up the middle container"
+Three conditions per task:
+  original  - visual cue ON, unchanged benchmark task
+  no_info   - cue disabled, no utterance -> guessing floor
+  utterance - cue disabled + scripted-user utterance at --args.utterance_step
+              (full prompt replacement)
 
-Reuses the running pi05 policy server (scripts/serve_policy.py) exactly like eval.py,
-sends no subgoal keys (pi05_baseline path), never uses history. Resumes from
-progress.json so the known SAPIEN segfault-on-env-recreation is survivable by
-relaunching in a loop.
+Reuses the running pi05 policy server exactly like eval.py, sends no subgoal keys,
+never uses history. Resumes from progress.json so the known SAPIEN segfault on env
+recreation is survivable by relaunching in a loop.
 
 Run (from robomme_policy_learning, benchmark .venv python):
   PYTHONPATH=examples/robomme CUDA_VISIBLE_DEVICES=0 SAPIEN_RENDER_DEVICE=cuda \
     <benchmark python> examples/robomme/eval_interactive.py \
-    --args.condition=utterance --args.port=8000 --args.num_episodes=10
+    --args.task=PickHighlight --args.condition=utterance --args.port=8000
 """
 
 import dataclasses
@@ -33,6 +41,12 @@ from env_runner import EnvRunner
 
 CONDITIONS = ("original", "no_info", "utterance")
 
+# Which env kwarg disables the visual cue for each supported task.
+TASK_DISABLE_KWARG = {
+    "ButtonUnmask": "robomme_disable_lift",
+    "PickHighlight": "robomme_disable_highlight",
+}
+
 
 @dataclasses.dataclass
 class Args:
@@ -41,8 +55,8 @@ class Args:
 
     condition: str = "utterance"  # original | no_info | utterance
     utterance_step: int = 10
-    num_episodes: int = 10        # first N episodes of the chosen difficulty (test split)
-    task: str = "ButtonUnmask"
+    num_episodes: int = 10        # valid (non-skipped) episodes to evaluate
+    task: str = "ButtonUnmask"    # ButtonUnmask | PickHighlight
     difficulty: str = "easy"
 
     obs_horizon: int = 16
@@ -52,7 +66,7 @@ class Args:
 
 
 class InteractiveEnvRunner(EnvRunner):
-    """EnvRunner that forwards extra env kwargs (e.g. robomme_disable_lift)."""
+    """EnvRunner that forwards extra env kwargs (e.g. the cue-disable flag)."""
 
     def __init__(self, env_id, video_save_dir, max_steps=1300, extra_env_kwargs=None):
         super().__init__(env_id, video_save_dir, max_steps=max_steps)
@@ -74,28 +88,52 @@ class InteractiveEnvRunner(EnvRunner):
         return ids
 
 
-def scripted_user_position_word(env):
-    """Ground truth from the env: where is the container hiding the asked-for cube.
-
-    The target is always bin_0 (it hides color_names[0], the color named in the
-    instruction). The front camera sits at +x looking down at the table with
-    image-right = +y, so sorting containers by world y gives left-to-right order.
-    """
+def episode_is_ambiguous(task: str, env) -> bool:
+    """PickHighlight only: a color-based referring expression is ambiguous if any
+    target color also appears on a non-target cube. Scene layout depends only on
+    the episode seed, so the same episodes are skipped in every condition."""
+    if task != "PickHighlight":
+        return False
     u = env.unwrapped
-    ys = []
-    for b in u.spawned_bins:
-        p = b.pose.p
-        if hasattr(p, "detach"):
-            p = p.detach().cpu().numpy()
-        ys.append(float(np.asarray(p).reshape(-1)[1]))
-    left_to_right = sorted(range(len(ys)), key=lambda i: ys[i])
-    rank = left_to_right.index(0)
-    if len(ys) == 3:
-        word = ("left", "middle", "right")[rank]
-    else:
-        word = f"{rank + 1}th from the left"
-    return word, {"bin_ys": ys, "target_rank_left_to_right": rank,
-                  "target_color": u.color_names[0]}
+    return any(u.all_cube_colors.count(c) > 1 for c in u.target_cube_colors)
+
+
+def scripted_user_utterance(task: str, env):
+    """Build the utterance from env ground truth. Returns (utterance, meta)."""
+    u = env.unwrapped
+
+    if task == "ButtonUnmask":
+        # Target is always bin_0 (it hides color_names[0], the color named in the
+        # instruction). Front camera sits at +x looking down; image-right = +y,
+        # so sorting containers by world y gives left-to-right order.
+        ys = []
+        for b in u.spawned_bins:
+            p = b.pose.p
+            if hasattr(p, "detach"):
+                p = p.detach().cpu().numpy()
+            ys.append(float(np.asarray(p).reshape(-1)[1]))
+        left_to_right = sorted(range(len(ys)), key=lambda i: ys[i])
+        rank = left_to_right.index(0)
+        if len(ys) == 3:
+            word = ("left", "middle", "right")[rank]
+        else:
+            word = f"{rank + 1}th from the left"
+        utterance = f"first press the button, then pick up the {word} container"
+        meta = {"bin_ys": ys, "target_rank_left_to_right": rank,
+                "target_color": u.color_names[0]}
+        return utterance, meta
+
+    if task == "PickHighlight":
+        colors = list(u.target_cube_colors)
+        if len(colors) == 1:
+            phrase = f"the {colors[0]} cube"
+        else:
+            phrase = " and ".join(f"the {c} cube" for c in colors)
+        utterance = f"first press the button, then pick up {phrase}"
+        meta = {"target_colors": colors, "all_colors": list(u.all_cube_colors)}
+        return utterance, meta
+
+    raise ValueError(f"no scripted user for task {task}")
 
 
 def run_episode(args: Args, env_runner: InteractiveEnvRunner, video_save_dir: Path):
@@ -124,10 +162,9 @@ def run_episode(args: Args, env_runner: InteractiveEnvRunner, video_save_dir: Pa
     utterance_prompt = None
     utterance_meta = None
     if args.condition == "utterance":
-        word, debug = scripted_user_position_word(env_runner.env)
-        utterance_prompt = f"first press the button, then pick up the {word} container"
+        utterance_prompt, utterance_meta = scripted_user_utterance(args.task, env_runner.env)
         utterance_meta = {"utterance_step": args.utterance_step,
-                          "utterance": utterance_prompt, **debug}
+                          "utterance": utterance_prompt, **utterance_meta}
         print(f"[scripted user] will say at step {args.utterance_step}: {utterance_prompt!r}")
 
     img, wrist_img, robot_state = epstate.get_current_obs()
@@ -174,6 +211,7 @@ def run_episode(args: Args, env_runner: InteractiveEnvRunner, video_save_dir: Pa
 
 def evaluate(args: Args):
     assert args.condition in CONDITIONS, f"condition must be one of {CONDITIONS}"
+    assert args.task in TASK_DISABLE_KWARG, f"task must be one of {list(TASK_DISABLE_KWARG)}"
 
     save_dir = Path(args.save_dir) / args.task / args.condition / f"seed{args.model_seed}"
     video_save_dir = save_dir / "videos"
@@ -183,27 +221,38 @@ def evaluate(args: Args):
     if progress_path.exists():
         with open(progress_path) as f:
             progress = json.load(f)
-        print(f"[interactive] resuming: {len(progress.get('episodes', {}))} episodes done")
+        print(f"[interactive] resuming: {len(progress.get('episodes', {}))} episodes recorded")
     else:
         progress = {"condition": args.condition, "episodes": {}, "utterances": {}}
 
     extra_env_kwargs = {}
     if args.condition in ("no_info", "utterance"):
-        extra_env_kwargs["robomme_disable_lift"] = True
+        extra_env_kwargs[TASK_DISABLE_KWARG[args.task]] = True
 
     env_runner = InteractiveEnvRunner(
         args.task, video_save_dir, max_steps=args.max_steps,
         extra_env_kwargs=extra_env_kwargs,
     )
-    episode_ids = env_runner.episodes_with_difficulty(args.difficulty)[: args.num_episodes]
-    print(f"[interactive] condition={args.condition} difficulty={args.difficulty} "
-          f"episodes={episode_ids}")
+    candidate_ids = env_runner.episodes_with_difficulty(args.difficulty)
+    print(f"[interactive] task={args.task} condition={args.condition} "
+          f"difficulty={args.difficulty} candidates={candidate_ids}")
 
-    for ep in episode_ids:
+    def n_valid():
+        return sum(1 for v in progress["episodes"].values() if v != "skipped_ambiguous")
+
+    for ep in candidate_ids:
+        if n_valid() >= args.num_episodes:
+            break
         if str(ep) in progress["episodes"]:
-            print(f"[interactive] ep{ep} already done, skipping")
             continue
         env_runner.make_env(ep)
+        if episode_is_ambiguous(args.task, env_runner.env):
+            print(f"[interactive] ep{ep} skipped: target color duplicated on table")
+            progress["episodes"][str(ep)] = "skipped_ambiguous"
+            env_runner.close_env()
+            with open(progress_path, "w") as f:
+                json.dump(progress, f, indent=2)
+            continue
         print(f"\n[interactive] {args.task} ep{ep} ({args.condition}) env ready, "
               f"difficulty={env_runner.difficulty}")
         flag, utt = run_episode(args, env_runner, video_save_dir)
@@ -215,11 +264,13 @@ def evaluate(args: Args):
             json.dump(progress, f, indent=2)
         print(f"[interactive] ep{ep} -> {flag}")
 
-    done = progress["episodes"]
+    done = {k: v for k, v in progress["episodes"].items() if v != "skipped_ambiguous"}
     n = len(done)
     succ = sum(1 for v in done.values() if v == "success")
-    summary = {"condition": args.condition, "episodes": n, "success": succ,
+    summary = {"task": args.task, "condition": args.condition,
+               "episodes": n, "success": succ,
                "success_rate": succ / n if n else None,
+               "skipped_ambiguous": len(progress["episodes"]) - n,
                "flags": {k: done[k] for k in sorted(done, key=int)}}
     with open(save_dir / "summary.json", "w") as f:
         json.dump(summary, f, indent=2)
