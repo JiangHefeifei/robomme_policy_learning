@@ -346,9 +346,25 @@ def run_episode(args: Args, env_runner, video_save_dir: Path, memory_store: dict
             break
 
     if success_flag != "unknown":
+        _pad_frames_to_same_size(recorder)  # prompt text area height varies with
+        # utterance length -> frame sizes can differ within one episode, which
+        # imageio rejects ("All images in a movie should have same size")
         recorder.save_video(f"{env_runner.env_id}_ep{env_runner.episode_id}_"
                             f"{args.condition}_{success_flag}_{env_runner.difficulty}.mp4")
     return success_flag, ctrl.episode_meta()
+
+
+def _pad_frames_to_same_size(recorder):
+    frames = recorder.total_images
+    if not frames:
+        return
+    h = max(f.shape[0] for f in frames)
+    w = max(f.shape[1] for f in frames)
+    for i, f in enumerate(frames):
+        if f.shape[0] != h or f.shape[1] != w:
+            canvas = np.zeros((h, w, f.shape[2]), dtype=f.dtype)
+            canvas[: f.shape[0], : f.shape[1]] = f
+            frames[i] = canvas
 
 
 def evaluate(args: Args):
