@@ -64,7 +64,10 @@ CONDITIONS = {
                       "prohibition", "ask", "ask_memory",
                       # Task 1 same-colour ambiguity (only runs on episodes where the
                       # target colour appears on >1 cube): guess floor / ask+point / memory replay
-                      "disambig_guess", "disambig_ask", "disambig_memory"],
+                      "disambig_guess", "disambig_ask", "disambig_memory",
+                      # VLM-in-the-loop human: Qwen3-VL watches every N steps and
+                      # decides itself whether/when/what to say (dynamic, not fixed-step)
+                      "utterance_vlm"],
     "ButtonUnmask": ["original", "no_info", "utterance", "ask", "ask_memory"],
     "MoveCube": ["prior", "told"],
     "BinFill": ["original", "vague", "told"],
@@ -105,6 +108,11 @@ class Args:
     max_steps: int = 1300
     save_dir: str = "runs/evaluation_interactive"
     model_seed: int = 7
+
+    # utterance_vlm: Qwen3-VL human-sim server
+    vlm_host: str = "0.0.0.0"
+    vlm_port: int = 8001
+    vlm_every: int = 20           # ask the VLM whether to interject every N steps
 
 
 class InteractiveEnvRunner(EnvRunner):
@@ -172,6 +180,41 @@ def ambiguous_instruction(u) -> str:
     return f"first press the button, then pick up the {target_color(u)} cube"
 
 
+def vlm_goal(task: str, u) -> str:
+    """What the user actually wants, in natural terms — given to the VLM human so it
+    role-plays 'a user who knows their goal' (not inferring the answer from pixels)."""
+    if task == "PickHighlight":
+        return disambig_answer(u).split("pick up ", 1)[-1]  # e.g. "the left blue cube"
+    if task == "ButtonUnmask":
+        return f"the {bin_position_word(u)} container (it hides the {u.color_names[0]} cube)"
+    raise ValueError(task)
+
+
+def scene_facts(u) -> str:
+    """What a person standing at the table plainly sees (a 4B model can't read this off
+    a 256x256 sim frame, but a human can) — colours present + same-colour ambiguity."""
+    from collections import Counter
+    colours = list(u.all_cube_colors)
+    cnt = Counter(colours)
+    dup = [c for c, n in cnt.items() if n > 1]
+    s = f"On the table there are {len(colours)} cubes, colours: {colours}."
+    if dup:
+        s += (" Note: " + ", ".join(f"{cnt[c]} {c} cubes" for c in dup)
+              + f" — so naming only a duplicated colour is ambiguous.")
+    return s
+
+
+def call_vlm_human(args, img, task, goal, step, already, hint=""):
+    """POST the current frame to the human-sim server; returns {speak, utterance, raw}."""
+    import cv2, base64, requests
+    ok, buf = cv2.imencode(".png", cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+    payload = {"image": base64.b64encode(buf).decode(), "task": task, "goal": goal,
+               "step": int(step), "already_said": already, "robot_state_hint": hint}
+    r = requests.post(f"http://{args.vlm_host}:{args.vlm_port}/interject",
+                      json=payload, timeout=60)
+    return r.json()
+
+
 def disambig_answer(u) -> str:
     """Human disambiguates the same-colour cubes by left/right position (image-right = +y).
     NOT a hard-coded 'always-left' rule — the word is derived from THIS episode's target,
@@ -208,6 +251,7 @@ class Controller:
         self.n_questions = 0
         self._pending = None      # prompt override once set
         self._fired = set()
+        self.vlm_goal_str = vlm_goal(self.task, self.u) if self.c == "utterance_vlm" else None
 
         t = self.task
         if self.c == "utterance":
@@ -246,7 +290,7 @@ class Controller:
             self._plan = []
 
     def initial_prompt(self) -> str:
-        if self.c in ("disambig_guess", "disambig_ask", "disambig_memory"):
+        if self.c in ("disambig_guess", "disambig_ask", "disambig_memory", "utterance_vlm"):
             return ambiguous_instruction(self.u)  # "pick up the blue cube" with 2 blues
         if self.c in ("reactive", "ask", "ask_memory") and self.task in VAGUE_PROMPTS:
             return VAGUE_PROMPTS[self.task]
@@ -325,7 +369,7 @@ def episode_skip_reason(args: Args, u) -> str:
     """Referential-ambiguity screens (seed-determined => identical across conditions)."""
     if args.task != "PickHighlight":
         return ""
-    if args.condition.startswith("disambig"):
+    if args.condition.startswith("disambig") or args.condition == "utterance_vlm":
         # Task 1 REQUIRES same-colour ambiguity -> keep only ambiguous episodes
         return "" if not target_color_unique(u) else "skipped_unambiguous"
     if args.condition in ("update", "prohibition"):
@@ -385,6 +429,19 @@ def run_episode(args: Args, env_runner, video_save_dir: Path, memory_store: dict
         obs, stop_flag, success_flag = env_runner.step(action)
         epstate.count += 1
         ctrl.on_step(epstate.count)
+
+        # utterance_vlm: every N steps let the Qwen3-VL human decide whether to speak
+        if args.condition == "utterance_vlm" and epstate.count % args.vlm_every == 0:
+            said = [e["text"] for e in ctrl.events if e["kind"] == "vlm"]
+            try:
+                resp = call_vlm_human(args, img, task_goal, ctrl.vlm_goal_str,
+                                      epstate.count, said, hint=scene_facts(ctrl.u))
+            except Exception as exc:
+                print(f"[vlm] call failed at step {epstate.count}: {exc}")
+                resp = {"speak": False}
+            if resp.get("speak") and resp.get("utterance"):
+                ctrl.n_questions += 1
+                ctrl._fire(epstate.count, "vlm", resp["utterance"])
 
         if epstate.count > args.max_steps:
             success_flag = "timeout"

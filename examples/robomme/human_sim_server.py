@@ -31,24 +31,42 @@ STATE = {"model": None, "processor": None, "model_name": None}
 
 
 SYSTEM_PROMPT = (
-    "You are a person giving a tabletop robot short spoken instructions. "
-    "You KNOW what you want (it is given to you as GOAL). Watch the robot's current "
-    "camera view and decide, like a real person would, whether to speak RIGHT NOW.\n"
-    "- Speak only when it helps: the task is ambiguous/underspecified, or the robot is "
-    "about to do the wrong thing, or it seems stuck.\n"
-    "- If everything looks fine and no help is needed yet, say nothing.\n"
-    "- When you do speak, use ONE short, natural, spoken sentence — the way a person "
-    "actually talks to a robot. Do not read out coordinates or internal state.\n"
-    "Reply as strict JSON: {\"speak\": true/false, \"utterance\": \"...\"}. "
-    "If speak is false, utterance is \"\"."
+    "You are the USER standing next to a tabletop robot arm, watching it try to do a "
+    "task. You KNOW exactly what you want — it is given to you as GOAL — but the robot "
+    "was only given a vague instruction, so it may not know. Each time you are shown the "
+    "robot's current camera view, decide like a real person whether to speak RIGHT NOW.\n"
+    "\n"
+    "SPEAK when the view shows one of these situations:\n"
+    "1. WRONG TARGET: the arm is reaching toward, hovering over, or about to grasp the "
+    "WRONG object (not your GOAL). Say a short correction, e.g. \"no, not that one — the "
+    "red one\".\n"
+    "2. WRONG METHOD: the robot is about to do the action the wrong way (e.g. grasping "
+    "when you wanted it pushed). Say e.g. \"don't grab it, push it\".\n"
+    "3. ABOUT TO VIOLATE a constraint/preference you hold (e.g. it is reaching for a cube "
+    "you never want touched). Say e.g. \"leave the green one, don't touch it\".\n"
+    "4. STUCK / WANDERING: the arm hovers, drifts, or has made no progress for a while, "
+    "clearly unsure. Give the missing information, e.g. \"the one on the left\".\n"
+    "\n"
+    "STAY SILENT when: the arm is still moving into position and hasn't committed to "
+    "anything wrong yet; or it is already doing the right thing; or you have nothing new "
+    "to add. When unsure, prefer to stay silent — a real person doesn't narrate every "
+    "moment, they speak up mainly when the robot is going wrong or clearly stuck.\n"
+    "\n"
+    "When you DO speak: ONE short, natural, spoken sentence, the way a person actually "
+    "talks to a robot. Refer to objects the way a person would (colour, 'the left one', "
+    "'that one'). Never read out coordinates or internal state. Do not repeat something "
+    "you already said.\n"
+    "\n"
+    "Reply as strict JSON only: {\"speak\": true|false, \"utterance\": \"...\"}. "
+    "If speak is false, utterance must be \"\"."
 )
 
 
 def load_model(model_name: str):
-    from transformers import AutoModelForImageTextToText, AutoProcessor
+    from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
     print(f"[human-sim] loading {model_name} ...", flush=True)
-    model = AutoModelForImageTextToText.from_pretrained(
-        model_name, torch_dtype=torch.bfloat16, device_map="cuda"
+    model = Qwen3VLForConditionalGeneration.from_pretrained(
+        model_name, dtype=torch.bfloat16, device_map="cuda"
     )
     processor = AutoProcessor.from_pretrained(model_name)
     model.eval()
@@ -78,12 +96,16 @@ def interject():
     step = data.get("step", 0)
     already = data.get("already_said", [])
 
+    hint = data.get("robot_state_hint", "")  # optional coarse cue from the harness
     user_text = (
-        f"TASK: {task}\n"
-        f"GOAL (what you, the user, want): {goal}\n"
-        f"Robot step: {step}. "
-        + (f"You already said: {already}. Don't repeat yourself. " if already else "")
-        + "Look at the current view. Speak now?"
+        f"TASK the robot was given (vague): {task}\n"
+        f"GOAL — what you actually want: {goal}\n"
+        f"Robot step: {step}.\n"
+        + (f"Observed: {hint}\n" if hint else "")
+        + (f"You have already said: {already} — do NOT repeat these.\n" if already else "")
+        + "Look carefully at what the arm is doing and which object it is reaching "
+        "toward. Is it going wrong or stuck relative to your GOAL? Decide whether to "
+        "speak now, and reply with the JSON."
     )
     messages = [
         {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT}]},
