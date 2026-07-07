@@ -1,42 +1,19 @@
-"""Interactive-RoboMME zero-shot probe: all seven interaction types on a frozen
+"""Interactive-RoboMME evaluation harness — unified 4 settings per task on a frozen
 pi05_baseline policy (no training, original scorers untouched).
 
-Tasks x conditions (easy difficulty, test split):
+Four settings, identical names across all four tasks:
+  baseline       vague instruction, visual cue OFF -> the info the robot needs is
+                 missing (the real scenario: a user gives a vague command).
+  utterance      same vague start, but at step 10 the correct answer is injected as
+                 one line of text (oracle upper bound: "if told, can pi0.5 use it?").
+  original       the benchmark's own visual cue is ON (highlight / lift / demo video /
+                 full instruction) — reference for "with the cue, how well does it do".
+  utterance_vlm  vague start, cue OFF; a Qwen3-VL "human" (human_sim_server) watches
+                 every N steps and decides itself whether/when/what to say.
 
-PickHighlight (color language — high zero-shot compliance):
-  original    visual highlight ON (benchmark as-is)
-  no_info     highlight OFF, no utterance (floor)
-  utterance   highlight OFF, told at step 10                      [type 1: told]
-  reactive    highlight OFF, vague prompt; when TCP approaches a
-              NON-target cube -> "No, not that one — pick up the
-              {color} cube."                                      [type 2: reactive correction]
-  update      highlight OFF, told WRONG color at step 10, corrected
-              at step 150 ("Actually, ... instead")               [type 6: mid-course change]
-  prohibition highlight OFF, only told what NOT to touch          [type 7: prohibition]
-  ask         highlight OFF, vague prompt; if still running at step
-              K the robot ASKS, scripted user answers by color,
-              answer injected + stored to memory_store.json       [type 5/ask: uncertainty-aware question]
-  ask_memory  highlight OFF; same layouts as `ask`, answer replayed
-              from memory at step 10, ZERO questions              [ask-or-remember closed loop]
-
-ButtonUnmask (spatial language — known-weak grounding):
-  original / no_info / utterance  (already measured)
-  ask / ask_memory                same stuck-triggered gate as above
-
-MoveCube (manner selection):                                      [type 3: better way]
-  prior       no utterance; policy acts on its own prior (the
-              no-history baseline never sees the demo video)
-  told        the sampled manner is told at step 10
-
-BinFill (standing preference as default params):                  [type 4: preference]
-  original    true instruction from step 0 (anchor)
-  vague       vague instruction all episode (floor)
-  told        vague until step 10, then the true preference is told
-
-Uncertainty signal (v0, zero-shot): a stuck detector — episode still running at
-step K with no info given => the gate fires one question. Honest limitation: this
-is a time-based proxy, not model introspection (flow matching has no token
-probabilities); ensembling/retrieval-confidence gates are method-stage work.
+Per-task specifics live in TASK_CONFIG. PickHighlight runs only on same-colour-ambiguity
+episodes (task 1). MoveCube's `original` uses history (so the policy sees the demo
+video); its other settings run no-history (pure prior).
 """
 
 import dataclasses
@@ -47,95 +24,17 @@ from pathlib import Path
 import numpy as np
 
 from openpi_client import websocket_client_policy as _websocket_client_policy
-from utils import EpisodeState, RolloutRecorder
+from utils import EpisodeState, RolloutRecorder, pack_buffer
 from env_runner import EnvRunner
 
 
-# (task, condition) -> env kwarg that disables the visual cue (None = no change)
-CUE_OFF = {
-    "ButtonUnmask": "robomme_disable_lift",
-    "PickHighlight": "robomme_disable_highlight",
-    "MoveCube": None,
-    "BinFill": None,
-}
-
-CONDITIONS = {
-    "PickHighlight": ["original", "no_info", "utterance", "reactive", "update",
-                      "prohibition", "ask", "ask_memory",
-                      # Task 1 same-colour ambiguity (only runs on episodes where the
-                      # target colour appears on >1 cube): guess floor / ask+point / memory replay
-                      "disambig_guess", "disambig_ask", "disambig_memory",
-                      # VLM-in-the-loop human: Qwen3-VL watches every N steps and
-                      # decides itself whether/when/what to say (dynamic, not fixed-step)
-                      "utterance_vlm"],
-    "ButtonUnmask": ["original", "no_info", "utterance", "ask", "ask_memory"],
-    "MoveCube": ["prior", "told"],
-    "BinFill": ["original", "vague", "told"],
-}
-
-# conditions that run with the visual cue ON / unchanged env
-CUE_ON_CONDITIONS = {"original", "prior", "vague", "told"}
-
-VAGUE_PROMPTS = {
-    "PickHighlight": "first press the button, then pick up the cube I want",
-    "ButtonUnmask": "first press the button, then pick up the container I want",
-    "BinFill": "put the cubes I like into the bin, then press the button to stop",
-}
-
-MOVECUBE_WAY_PROMPT = {
-    "peg_push": "pick up the peg and use it to push the cube onto the target - do not grasp the cube",
-    "gripper_push": "push the cube onto the target with your gripper - do not grasp the cube",
-    "grasp_putdown": "pick up the cube and place it down on the target",
-}
+CONDITIONS = ["baseline", "utterance", "original", "utterance_vlm"]
+TASKS = ["PickHighlight", "ButtonUnmask", "MoveCube", "BinFill"]
 
 
-@dataclasses.dataclass
-class Args:
-    host: str = "0.0.0.0"
-    port: int = 8000
-
-    task: str = "PickHighlight"
-    condition: str = "utterance"
-    utterance_step: int = 10      # told / update(first) / prohibition / ask_memory replay
-    update_step: int = 150        # update: when the correction arrives
-    ask_step: int = 100           # ask: stuck/no-info detector threshold (fires before
-                                  # the policy typically commits to a wrong grasp)
-    proximity_m: float = 0.10     # reactive: TCP-to-non-target trigger distance
-
-    num_episodes: int = 10
-    difficulty: str = "easy"
-    obs_horizon: int = 16
-    max_steps: int = 1300
-    save_dir: str = "runs/evaluation_interactive"
-    model_seed: int = 7
-
-    # utterance_vlm: Qwen3-VL human-sim server
-    vlm_host: str = "0.0.0.0"
-    vlm_port: int = 8001
-    vlm_every: int = 20           # ask the VLM whether to interject every N steps
-
-
-class InteractiveEnvRunner(EnvRunner):
-    def __init__(self, env_id, video_save_dir, max_steps=1300, extra_env_kwargs=None):
-        super().__init__(env_id, video_save_dir, max_steps=max_steps)
-        self.extra_env_kwargs = dict(extra_env_kwargs or {})
-
-    def make_env(self, episode_id: int) -> None:
-        self.env = self.env_builder.make_env_for_episode(
-            episode_id, extra_env_kwargs=self.extra_env_kwargs
-        )
-        self.episode_id = episode_id
-        self.difficulty = self.env.unwrapped.difficulty
-
-    def episodes_with_difficulty(self, difficulty: str):
-        return [ep for ep in range(self.env_builder.get_episode_num())
-                if self.env_builder.resolve_episode(ep)[1] == difficulty]
-
-
-# ---------------------------------------------------------------- ground truth
+# ------------------------------------------------------------------ ground truth
 
 def _pos(obj):
-    """World position of an actor (has .pose) or a raw Pose (has .p)."""
     p = obj.pose.p if hasattr(obj, "pose") else obj.p
     if hasattr(p, "detach"):
         p = p.detach().cpu().numpy()
@@ -146,79 +45,19 @@ def target_color(u):
     return u.target_cube_colors[0]
 
 
-def nontarget_colors(u):
-    return [c for c in u.all_cube_colors if c not in u.target_cube_colors]
-
-
 def target_color_unique(u) -> bool:
     return all(u.all_cube_colors.count(c) == 1 for c in u.target_cube_colors)
 
 
-def all_colors_unique(u) -> bool:
-    return len(set(u.all_cube_colors)) == len(u.all_cube_colors)
-
-
 def bin_position_word(u) -> str:
-    """ButtonUnmask: target is always bin_0; image-right = +y."""
+    """ButtonUnmask: target is always bin_0; front camera image-right = +y."""
     ys = [float(_pos(b)[1]) for b in u.spawned_bins]
     rank = sorted(range(len(ys)), key=lambda i: ys[i]).index(0)
     return ("left", "middle", "right")[rank] if len(ys) == 3 else f"{rank + 1}th from the left"
 
 
-def resolved_instruction(task: str, u) -> str:
-    """The fully-resolved instruction a cooperative human would give."""
-    if task == "PickHighlight":
-        return f"first press the button, then pick up the {target_color(u)} cube"
-    if task == "ButtonUnmask":
-        return f"first press the button, then pick up the {bin_position_word(u)} container"
-    raise ValueError(task)
-
-
-def ambiguous_instruction(u) -> str:
-    """Task 1: a colour-referring instruction that is genuinely ambiguous because the
-    target colour appears on more than one cube ("pick up the blue cube" w/ 2 blues)."""
-    return f"first press the button, then pick up the {target_color(u)} cube"
-
-
-def vlm_goal(task: str, u) -> str:
-    """What the user actually wants, in natural terms — given to the VLM human so it
-    role-plays 'a user who knows their goal' (not inferring the answer from pixels)."""
-    if task == "PickHighlight":
-        return disambig_answer(u).split("pick up ", 1)[-1]  # e.g. "the left blue cube"
-    if task == "ButtonUnmask":
-        return f"the {bin_position_word(u)} container (it hides the {u.color_names[0]} cube)"
-    raise ValueError(task)
-
-
-def scene_facts(u) -> str:
-    """What a person standing at the table plainly sees (a 4B model can't read this off
-    a 256x256 sim frame, but a human can) — colours present + same-colour ambiguity."""
-    from collections import Counter
-    colours = list(u.all_cube_colors)
-    cnt = Counter(colours)
-    dup = [c for c, n in cnt.items() if n > 1]
-    s = f"On the table there are {len(colours)} cubes, colours: {colours}."
-    if dup:
-        s += (" Note: " + ", ".join(f"{cnt[c]} {c} cubes" for c in dup)
-              + f" — so naming only a duplicated colour is ambiguous.")
-    return s
-
-
-def call_vlm_human(args, img, task, goal, step, already, hint=""):
-    """POST the current frame to the human-sim server; returns {speak, utterance, raw}."""
-    import cv2, base64, requests
-    ok, buf = cv2.imencode(".png", cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
-    payload = {"image": base64.b64encode(buf).decode(), "task": task, "goal": goal,
-               "step": int(step), "already_said": already, "robot_state_hint": hint}
-    r = requests.post(f"http://{args.vlm_host}:{args.vlm_port}/interject",
-                      json=payload, timeout=60)
-    return r.json()
-
-
-def disambig_answer(u) -> str:
-    """Human disambiguates the same-colour cubes by left/right position (image-right = +y).
-    NOT a hard-coded 'always-left' rule — the word is derived from THIS episode's target,
-    so different layouts yield different answers."""
+def pick_position_word(u) -> str:
+    """PickHighlight: rank of the target among same-colour cubes, left->right (+y)."""
     tc = target_color(u)
     same_ys = sorted(float(_pos(u.all_cubes[i])[1])
                      for i in range(len(u.all_cubes)) if u.all_cube_colors[i] == tc)
@@ -226,163 +65,236 @@ def disambig_answer(u) -> str:
     rank = min(range(len(same_ys)), key=lambda k: abs(same_ys[k] - ty))
     n = len(same_ys)
     if n == 2:
-        word = "left" if rank == 0 else "right"
-    elif n == 3:
-        word = ("left", "middle", "right")[rank]
-    else:
-        word = f"{rank + 1}-th from the left"
-    return f"first press the button, then pick up the {word} {tc} cube"
+        return "left" if rank == 0 else "right"
+    if n == 3:
+        return ("left", "middle", "right")[rank]
+    return f"{rank + 1}-th from the left"
 
 
-# ------------------------------------------------------- per-episode controller
+MOVECUBE_WAY_PROMPT = {
+    "peg_push": "pick up the peg and use it to push the cube onto the target - do not grasp the cube",
+    "gripper_push": "push the cube onto the target with your gripper - do not grasp the cube",
+    "grasp_putdown": "pick up the cube and place it down on the target",
+}
+MOVECUBE_WAY_GOAL = {
+    "peg_push": "push the cube onto the target using the peg (do NOT grasp the cube)",
+    "gripper_push": "push the cube onto the target with the gripper (do NOT grasp the cube)",
+    "grasp_putdown": "grasp the cube and place it down on the target",
+}
+
+
+def binfill_pref(u):
+    return {"red": getattr(u, "red_cubes_target_number", 0),
+            "blue": getattr(u, "blue_cubes_target_number", 0),
+            "green": getattr(u, "green_cubes_target_number", 0)}
+
+
+def binfill_goal(u) -> str:
+    parts = [f"{n} {c}" for c, n in binfill_pref(u).items() if n > 0]
+    return "put " + ", ".join(parts) + " cube(s) into the bin"
+
+
+# ---- per-task behaviour: vague prompt / informed answer / vlm goal / scene facts ----
+
+def _pick_vague(u, tg):
+    return f"first press the button, then pick up the {target_color(u)} cube"  # 2 same-colour
+
+
+def _pick_informed(u, tg):
+    return f"first press the button, then pick up the {pick_position_word(u)} {target_color(u)} cube"
+
+
+def _pick_goal(u):
+    return f"the {pick_position_word(u)} {target_color(u)} cube"
+
+
+def _pick_scene(u):
+    from collections import Counter
+    cs = list(u.all_cube_colors); cnt = Counter(cs)
+    dup = [c for c, n in cnt.items() if n > 1]
+    s = f"On the table there are {len(cs)} cubes, colours: {cs}."
+    if dup:
+        s += " Note: " + ", ".join(f"{cnt[c]} {c} cubes" for c in dup) + " — naming only that colour is ambiguous."
+    return s
+
+
+def _btn_informed(u, tg):
+    return f"first press the button, then pick up the {bin_position_word(u)} container"
+
+
+def _btn_goal(u):
+    return f"the {bin_position_word(u)} container (it hides the {u.color_names[0]} cube)"
+
+
+def _btn_scene(u):
+    n = len(u.spawned_bins)
+    return (f"On the table there are {n} identical closed containers in a row; you cannot "
+            f"see which cube is under which — but you know your target is the "
+            f"{bin_position_word(u)} one.")
+
+
+def _move_informed(u, tg):
+    return MOVECUBE_WAY_PROMPT[u.way]
+
+
+def _move_goal(u):
+    return MOVECUBE_WAY_GOAL[u.way]
+
+
+def _move_scene(u):
+    return ("A single cube and a target marker are on the table. The robot can move the "
+            "cube in different ways (push with a peg, push with the gripper, or grasp and "
+            "place). Watch whether it is grasping when it should push, or vice versa.")
+
+
+def _bin_informed(u, tg):
+    return tg  # the benchmark's real full instruction (encodes the preference)
+
+
+def _bin_scene(u):
+    from collections import Counter
+    return (f"Coloured cubes and one bin are on the table. You have a preference for what "
+            f"goes in: {binfill_goal(u)}. Watch whether the robot puts in the wrong colour "
+            f"or the wrong number.")
+
+
+TASK_CONFIG = {
+    "PickHighlight": dict(cue_off="robomme_disable_highlight", ambiguous_only=True,
+                          original_history=False, vague=_pick_vague, informed=_pick_informed,
+                          goal=_pick_goal, scene=_pick_scene),
+    "ButtonUnmask": dict(cue_off="robomme_disable_lift", ambiguous_only=False,
+                         original_history=False, vague=lambda u, tg: tg, informed=_btn_informed,
+                         goal=_btn_goal, scene=_btn_scene),
+    "MoveCube": dict(cue_off=None, ambiguous_only=False, original_history=True,
+                     vague=lambda u, tg: "move the cube onto the target", informed=_move_informed,
+                     goal=_move_goal, scene=_move_scene),
+    "BinFill": dict(cue_off=None, ambiguous_only=False, original_history=False,
+                    vague=lambda u, tg: "put the cubes I like into the bin, then press the button to stop",
+                    informed=_bin_informed, goal=binfill_goal, scene=_bin_scene),
+}
+
+
+# ------------------------------------------------------------------- VLM client
+
+def call_vlm_human(args, img, task, goal, step, already, hint=""):
+    import cv2, base64, requests
+    ok, buf = cv2.imencode(".png", cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+    payload = {"image": base64.b64encode(buf).decode(), "task": task, "goal": goal,
+               "step": int(step), "already_said": already, "robot_state_hint": hint}
+    r = requests.post(f"http://{args.vlm_host}:{args.vlm_port}/interject", json=payload, timeout=60)
+    return r.json()
+
+
+def approaching_wrong_hint(u, proximity=0.12):
+    """Difficulty-2 helper: coarse action cue a person would see — is the gripper
+    heading for a non-target object? Only meaningful for PickHighlight."""
+    try:
+        tcp = _pos(u.agent.tcp_pose)
+        nts = [c for c in u.all_cubes if c not in u.target_cubes]
+        if nts and min(float(np.linalg.norm(tcp - _pos(c))) for c in nts) < proximity:
+            return "The robot arm is currently reaching toward one of the cubes that is NOT your target."
+    except Exception:
+        pass
+    return ""
+
+
+# --------------------------------------------------------------------- Args
+
+@dataclasses.dataclass
+class Args:
+    host: str = "0.0.0.0"
+    port: int = 8000
+    task: str = "PickHighlight"
+    condition: str = "baseline"
+    utterance_step: int = 10
+    num_episodes: int = 10
+    difficulty: str = "easy"
+    obs_horizon: int = 16
+    max_steps: int = 1300
+    save_dir: str = "runs/evaluation_interactive"
+    model_seed: int = 7
+    use_history: bool = False      # forced True internally for MoveCube/original
+    vlm_host: str = "0.0.0.0"
+    vlm_port: int = 8001
+    vlm_every: int = 20
+
+
+class InteractiveEnvRunner(EnvRunner):
+    def __init__(self, env_id, video_save_dir, max_steps=1300, extra_env_kwargs=None):
+        super().__init__(env_id, video_save_dir, max_steps=max_steps)
+        self.extra_env_kwargs = dict(extra_env_kwargs or {})
+
+    def make_env(self, episode_id: int) -> None:
+        self.env = self.env_builder.make_env_for_episode(
+            episode_id, extra_env_kwargs=self.extra_env_kwargs)
+        self.episode_id = episode_id
+        self.difficulty = self.env.unwrapped.difficulty
+
+    def episodes_with_difficulty(self, difficulty: str):
+        return [ep for ep in range(self.env_builder.get_episode_num())
+                if self.env_builder.resolve_episode(ep)[1] == difficulty]
+
+
+# ------------------------------------------------------ per-episode controller
 
 class Controller:
-    """Decides the prompt at every chunk boundary; fires trigger-based events."""
+    """Owns the prompt at every chunk boundary for the 4 unified settings."""
 
-    def __init__(self, args: Args, task_goal: str, env, memory_store: dict):
+    def __init__(self, args, task_goal, env):
         self.args = args
         self.c = args.condition
         self.task = args.task
-        self.env = env
+        self.cfg = TASK_CONFIG[args.task]
         self.u = env.unwrapped
         self.task_goal = task_goal
-        self.memory_store = memory_store
-        self.events = []          # [{step, kind, text}]
-        self.n_questions = 0
-        self._pending = None      # prompt override once set
-        self._fired = set()
-        self.vlm_goal_str = vlm_goal(self.task, self.u) if self.c == "utterance_vlm" else None
-
-        t = self.task
-        if self.c == "utterance":
-            self._plan = [(args.utterance_step, "tell", resolved_instruction(t, self.u))]
-        elif self.c == "update":
-            decoy = nontarget_colors(self.u)[0]
-            self._plan = [
-                (args.utterance_step, "tell",
-                 f"first press the button, then pick up the {decoy} cube"),
-                (args.update_step, "update",
-                 f"actually, do not pick the {decoy} cube - "
-                 f"pick up the {target_color(self.u)} cube instead"),
-            ]
-        elif self.c == "prohibition":
-            c1, c2 = nontarget_colors(self.u)[:2]
-            self._plan = [(args.utterance_step, "tell",
-                           f"first press the button, then pick up a cube, "
-                           f"but do not touch the {c1} cube and do not touch the {c2} cube")]
-        elif self.c == "told" and t == "MoveCube":
-            self._plan = [(args.utterance_step, "tell", MOVECUBE_WAY_PROMPT[self.u.way])]
-        elif self.c == "told" and t == "BinFill":
-            self._plan = [(args.utterance_step, "tell", task_goal)]  # true preference told at t
-        elif self.c == "ask_memory":
-            remembered = self.memory_store.get(t, {}).get(str(getattr(env, "episode_id", "")), None)
-            self._remembered = remembered
-            self._plan = ([(args.utterance_step, "memory", remembered)]
-                          if remembered else [])
-        elif self.c == "disambig_memory":
-            remembered = self.memory_store.get(t + "_disambig", {}).get(
-                str(getattr(env, "episode_id", "")), None)
-            self._remembered = remembered
-            self._plan = ([(args.utterance_step, "memory", remembered)]
-                          if remembered else [])
-        else:
-            # disambig_guess (vague, never resolved) and disambig_ask (question in on_step)
-            self._plan = []
+        self.events = []
+        self.n_interject = 0
+        self._pending = None
+        self.vague = self.cfg["vague"](self.u, task_goal)
+        self.informed = self.cfg["informed"](self.u, task_goal)
+        self.vlm_goal_str = self.cfg["goal"](self.u)
 
     def initial_prompt(self) -> str:
-        if self.c in ("disambig_guess", "disambig_ask", "disambig_memory", "utterance_vlm"):
-            return ambiguous_instruction(self.u)  # "pick up the blue cube" with 2 blues
-        if self.c in ("reactive", "ask", "ask_memory") and self.task in VAGUE_PROMPTS:
-            return VAGUE_PROMPTS[self.task]
-        if self.c == "vague":
-            return VAGUE_PROMPTS[self.task]
-        if self.c == "told" and self.task == "BinFill":
-            return VAGUE_PROMPTS["BinFill"]
-        return self.task_goal
-
-    def _fire(self, step, kind, text):
-        key = (kind, text)
-        if key in self._fired:
-            return
-        self._fired.add(key)
-        self._pending = text
-        self.events.append({"step": int(step), "kind": kind, "text": text})
-        print(f"[scripted user] step {step} [{kind}]: {text!r}")
+        if self.c == "original":
+            return self.task_goal          # benchmark's own instruction, cue ON
+        return self.vague                  # baseline / utterance / utterance_vlm start vague
 
     def on_step(self, step: int):
-        # scheduled utterances
-        for (t, kind, text) in self._plan:
-            if text and step >= t:
-                self._fire(t, kind, text)
+        # utterance: inject the correct answer once at utterance_step
+        if self.c == "utterance" and step >= self.args.utterance_step and self._pending is None:
+            self._pending = self.informed
+            self.events.append({"step": int(step), "kind": "tell", "text": self.informed})
+            print(f"[scripted user] step {step} [tell]: {self.informed!r}", flush=True)
 
-        # reactive: TCP approaches a non-target cube
-        if self.c == "reactive" and self.task == "PickHighlight":
-            tcp = _pos(self.u.agent.tcp_pose)
-            nts = [cube for cube in self.u.all_cubes if cube not in self.u.target_cubes]
-            if nts:
-                d = min(float(np.linalg.norm(tcp - _pos(cb))) for cb in nts)
-                if d < self.args.proximity_m:
-                    self._fire(step, "correction",
-                               f"no, not that one - pick up the {target_color(self.u)} cube")
+    def vlm_said(self):
+        return [e["text"] for e in self.events if e["kind"] == "vlm"]
 
-        # ask: stuck-detector question
-        if self.c == "ask" and step >= self.args.ask_step and not getattr(self, "_asked", False):
-            self._asked = True
-            answer = resolved_instruction(self.task, self.u)
-            question = ("which cube do you want?" if self.task == "PickHighlight"
-                        else "which container should I pick up?")
-            self.n_questions += 1
-            self.events.append({"step": int(step), "kind": "question", "text": question})
-            print(f"[robot asks] step {step}: {question!r}")
-            self._fire(step, "answer", answer)
-
-        # disambig_ask: ambiguity is known from the start -> ask at utterance_step,
-        # human disambiguates the same-colour cubes by position
-        if self.c == "disambig_ask" and step >= self.args.utterance_step \
-                and not getattr(self, "_asked", False):
-            self._asked = True
-            answer = disambig_answer(self.u)
-            question = f"which {target_color(self.u)} cube do you want?"
-            self.n_questions += 1
-            self.events.append({"step": int(step), "kind": "question", "text": question})
-            print(f"[robot asks] step {step}: {question!r}")
-            self._fire(step, "answer", answer)
+    def add_vlm(self, step, text):
+        self._pending = text
+        self.n_interject += 1
+        self.events.append({"step": int(step), "kind": "vlm", "text": text})
+        print(f"[vlm human] step {step}: {text!r}", flush=True)
 
     def current_prompt(self) -> str:
         return self._pending if self._pending is not None else self.initial_prompt()
 
     def episode_meta(self):
-        meta = {"events": self.events, "n_questions": self.n_questions}
-        if self.c in ("ask", "disambig_ask"):
-            # persist the answer for the *_memory replay pass
-            for e in self.events:
-                if e["kind"] == "answer":
-                    meta["stored_answer"] = e["text"]
-        if self.c in ("ask_memory", "disambig_memory"):
-            meta["memory_hit"] = bool(getattr(self, "_remembered", None))
+        meta = {"events": self.events, "n_interject": self.n_interject}
         if self.task == "MoveCube":
             meta["sampled_way"] = self.u.way
         return meta
 
 
-def episode_skip_reason(args: Args, u) -> str:
-    """Referential-ambiguity screens (seed-determined => identical across conditions)."""
-    if args.task != "PickHighlight":
-        return ""
-    if args.condition.startswith("disambig") or args.condition == "utterance_vlm":
-        # Task 1 REQUIRES same-colour ambiguity -> keep only ambiguous episodes
+def episode_skip_reason(args, u) -> str:
+    if TASK_CONFIG[args.task]["ambiguous_only"]:
         return "" if not target_color_unique(u) else "skipped_unambiguous"
-    if args.condition in ("update", "prohibition"):
-        if not all_colors_unique(u):
-            return "skipped_ambiguous"
-    elif not target_color_unique(u):
-        return "skipped_ambiguous"
     return ""
 
 
 # ------------------------------------------------------------------- main loop
 
-def run_episode(args: Args, env_runner, video_save_dir: Path, memory_store: dict):
+def run_episode(args, env_runner, video_save_dir):
+    use_history = args.use_history or (args.task == "MoveCube" and args.condition == "original")
     client = _websocket_client_policy.MMEVLAWebsocketClientPolicy(args.host, args.port)
     resp = client.reset()
     while not resp.get("reset_finished", False):
@@ -391,12 +303,11 @@ def run_episode(args: Args, env_runner, video_save_dir: Path, memory_store: dict
     epstate = EpisodeState()
     pre_traj = env_runner.get_init_obs()
     task_goal = pre_traj["task_goal"]
-
-    env_runner.env.episode_id = env_runner.episode_id  # for ask_memory lookup
-    ctrl = Controller(args, task_goal, env_runner.env, memory_store)
+    ctrl = Controller(args, task_goal, env_runner.env)
 
     recorder = RolloutRecorder(video_save_dir, ctrl.initial_prompt(), fps=30)
-    print(f"task_goal: {task_goal}  |  initial prompt: {ctrl.initial_prompt()!r}")
+    print(f"task_goal: {task_goal}  |  init prompt: {ctrl.initial_prompt()!r}  |  "
+          f"history={use_history}", flush=True)
 
     epstate.image_buffer.extend(pre_traj["images"])
     epstate.wrist_image_buffer.extend(pre_traj["wrist_images"])
@@ -415,12 +326,13 @@ def run_episode(args: Args, env_runner, video_save_dir: Path, memory_store: dict
             prompt = ctrl.current_prompt()
             if prompt != ctrl.initial_prompt() or ctrl.events:
                 recorder.task_goal = "[HUMAN] " + prompt
-            element = {
-                "observation/image": img,
-                "observation/wrist_image": wrist_img,
-                "observation/state": robot_state,
-                "prompt": prompt,
-            }
+            if use_history:
+                r = client.add_buffer(pack_buffer(epstate.image_buffer, epstate.state_buffer,
+                                                  epstate.exec_start_idx))
+                while not r.get("add_buffer_finished", False):
+                    time.sleep(0.1)
+            element = {"observation/image": img, "observation/wrist_image": wrist_img,
+                       "observation/state": robot_state, "prompt": prompt}
             action_chunk = client.infer(element)["actions"]
             epstate.action_plan.extend(action_chunk[: args.obs_horizon])
             epstate.clear_buffers()
@@ -430,23 +342,24 @@ def run_episode(args: Args, env_runner, video_save_dir: Path, memory_store: dict
         epstate.count += 1
         ctrl.on_step(epstate.count)
 
-        # utterance_vlm: every N steps let the Qwen3-VL human decide whether to speak
         if args.condition == "utterance_vlm" and epstate.count % args.vlm_every == 0:
-            said = [e["text"] for e in ctrl.events if e["kind"] == "vlm"]
+            hint = ctrl.cfg["scene"](ctrl.u)
+            if args.task == "PickHighlight":
+                aw = approaching_wrong_hint(ctrl.u)
+                if aw:
+                    hint += " " + aw
             try:
                 resp = call_vlm_human(args, img, task_goal, ctrl.vlm_goal_str,
-                                      epstate.count, said, hint=scene_facts(ctrl.u))
+                                      epstate.count, ctrl.vlm_said(), hint=hint)
             except Exception as exc:
-                print(f"[vlm] call failed at step {epstate.count}: {exc}")
+                print(f"[vlm] call failed at step {epstate.count}: {exc}", flush=True)
                 resp = {"speak": False}
             if resp.get("speak") and resp.get("utterance"):
-                ctrl.n_questions += 1
-                ctrl._fire(epstate.count, "vlm", resp["utterance"])
+                ctrl.add_vlm(epstate.count, resp["utterance"])
 
         if epstate.count > args.max_steps:
             success_flag = "timeout"
             break
-
         img, wrist_img, robot_state = obs
         epstate.add_observation(img, wrist_img, robot_state)
         recorder.record(image=img.copy(), wrist_image=wrist_img.copy(),
@@ -455,20 +368,17 @@ def run_episode(args: Args, env_runner, video_save_dir: Path, memory_store: dict
             break
 
     if success_flag != "unknown":
-        _pad_frames_to_same_size(recorder)  # prompt text area height varies with
-        # utterance length -> frame sizes can differ within one episode, which
-        # imageio rejects ("All images in a movie should have same size")
+        _pad_frames(recorder)
         recorder.save_video(f"{env_runner.env_id}_ep{env_runner.episode_id}_"
                             f"{args.condition}_{success_flag}_{env_runner.difficulty}.mp4")
     return success_flag, ctrl.episode_meta()
 
 
-def _pad_frames_to_same_size(recorder):
+def _pad_frames(recorder):
     frames = recorder.total_images
     if not frames:
         return
-    h = max(f.shape[0] for f in frames)
-    w = max(f.shape[1] for f in frames)
+    h = max(f.shape[0] for f in frames); w = max(f.shape[1] for f in frames)
     for i, f in enumerate(frames):
         if f.shape[0] != h or f.shape[1] != w:
             canvas = np.zeros((h, w, f.shape[2]), dtype=f.dtype)
@@ -477,37 +387,32 @@ def _pad_frames_to_same_size(recorder):
 
 
 def evaluate(args: Args):
-    assert args.task in CONDITIONS, f"task must be one of {list(CONDITIONS)}"
-    assert args.condition in CONDITIONS[args.task], \
-        f"{args.task} supports {CONDITIONS[args.task]}"
+    assert args.task in TASK_CONFIG, f"task must be one of {TASKS}"
+    assert args.condition in CONDITIONS, f"condition must be one of {CONDITIONS}"
 
     save_dir = Path(args.save_dir) / args.task / args.condition / f"seed{args.model_seed}"
     video_save_dir = save_dir / "videos"
     save_dir.mkdir(parents=True, exist_ok=True)
 
-    memory_path = Path(args.save_dir) / "memory_store.json"
-    memory_store = json.loads(memory_path.read_text()) if memory_path.exists() else {}
-
     progress_path = save_dir / "progress.json"
     if progress_path.exists():
         progress = json.loads(progress_path.read_text())
-        print(f"[interactive] resuming: {len(progress.get('episodes', {}))} recorded")
+        print(f"[interactive] resuming: {len(progress.get('episodes', {}))} recorded", flush=True)
     else:
-        progress = {"condition": args.condition, "episodes": {}, "meta": {}}
+        progress = {"task": args.task, "condition": args.condition, "episodes": {}, "meta": {}}
 
     extra = {}
-    cue_kwarg = CUE_OFF.get(args.task)
-    if cue_kwarg and args.condition not in CUE_ON_CONDITIONS:
-        extra[cue_kwarg] = True
+    cue_off = TASK_CONFIG[args.task]["cue_off"]
+    if cue_off and args.condition != "original":   # baseline/utterance/vlm hide the cue
+        extra[cue_off] = True
 
     env_runner = InteractiveEnvRunner(args.task, video_save_dir,
                                       max_steps=args.max_steps, extra_env_kwargs=extra)
     candidates = env_runner.episodes_with_difficulty(args.difficulty)
-    print(f"[interactive] {args.task}/{args.condition} candidates={candidates}")
+    print(f"[interactive] {args.task}/{args.condition} candidates={candidates}", flush=True)
 
     def n_valid():
-        return sum(1 for v in progress["episodes"].values()
-                   if not str(v).startswith("skipped_"))
+        return sum(1 for v in progress["episodes"].values() if not str(v).startswith("skipped_"))
 
     for ep in candidates:
         if n_valid() >= args.num_episodes:
@@ -517,39 +422,29 @@ def evaluate(args: Args):
         env_runner.make_env(ep)
         reason = episode_skip_reason(args, env_runner.env.unwrapped)
         if reason:
-            print(f"[interactive] ep{ep} {reason}")
             progress["episodes"][str(ep)] = reason
             env_runner.close_env()
             progress_path.write_text(json.dumps(progress, indent=2))
             continue
-        print(f"\n[interactive] {args.task} ep{ep} ({args.condition})")
-        flag, meta = run_episode(args, env_runner, video_save_dir, memory_store)
+        print(f"\n[interactive] {args.task} ep{ep} ({args.condition})", flush=True)
+        flag, meta = run_episode(args, env_runner, video_save_dir)
         progress["episodes"][str(ep)] = flag
         progress["meta"][str(ep)] = meta
         env_runner.close_env()
-
-        if args.condition in ("ask", "disambig_ask") and meta.get("stored_answer"):
-            mem_key = args.task + ("_disambig" if args.condition == "disambig_ask" else "")
-            memory_store.setdefault(mem_key, {})[str(ep)] = meta["stored_answer"]
-            memory_path.write_text(json.dumps(memory_store, indent=2))
-
         progress_path.write_text(json.dumps(progress, indent=2))
-        print(f"[interactive] ep{ep} -> {flag}")
+        print(f"[interactive] ep{ep} -> {flag}", flush=True)
 
-    done = {k: v for k, v in progress["episodes"].items()
-            if not str(v).startswith("skipped_")}
-    n = len(done)
-    succ = sum(1 for v in done.values() if v == "success")
+    done = {k: v for k, v in progress["episodes"].items() if not str(v).startswith("skipped_")}
+    n = len(done); succ = sum(1 for v in done.values() if v == "success")
     tout = sum(1 for v in done.values() if v == "timeout")
-    qs = sum(progress["meta"].get(k, {}).get("n_questions", 0) for k in done)
-    summary = {"task": args.task, "condition": args.condition,
-               "episodes": n, "success": succ,
-               "success_rate": succ / n if n else None,
-               "timeouts": tout, "questions_total": qs,
-               "skipped_ambiguous": len(progress["episodes"]) - n,
+    interj = sum(progress["meta"].get(k, {}).get("n_interject", 0) for k in done)
+    summary = {"task": args.task, "condition": args.condition, "episodes": n, "success": succ,
+               "success_rate": succ / n if n else None, "timeouts": tout,
+               "interjections_total": interj,
+               "skipped": len(progress["episodes"]) - n,
                "flags": {k: done[k] for k in sorted(done, key=int)}}
     (save_dir / "summary.json").write_text(json.dumps(summary, indent=2))
-    print("[interactive] FINAL " + json.dumps(summary))
+    print("[interactive] FINAL " + json.dumps(summary), flush=True)
 
 
 if __name__ == "__main__":
