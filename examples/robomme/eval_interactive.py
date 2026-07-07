@@ -61,7 +61,10 @@ CUE_OFF = {
 
 CONDITIONS = {
     "PickHighlight": ["original", "no_info", "utterance", "reactive", "update",
-                      "prohibition", "ask", "ask_memory"],
+                      "prohibition", "ask", "ask_memory",
+                      # Task 1 same-colour ambiguity (only runs on episodes where the
+                      # target colour appears on >1 cube): guess floor / ask+point / memory replay
+                      "disambig_guess", "disambig_ask", "disambig_memory"],
     "ButtonUnmask": ["original", "no_info", "utterance", "ask", "ask_memory"],
     "MoveCube": ["prior", "told"],
     "BinFill": ["original", "vague", "told"],
@@ -163,6 +166,31 @@ def resolved_instruction(task: str, u) -> str:
     raise ValueError(task)
 
 
+def ambiguous_instruction(u) -> str:
+    """Task 1: a colour-referring instruction that is genuinely ambiguous because the
+    target colour appears on more than one cube ("pick up the blue cube" w/ 2 blues)."""
+    return f"first press the button, then pick up the {target_color(u)} cube"
+
+
+def disambig_answer(u) -> str:
+    """Human disambiguates the same-colour cubes by left/right position (image-right = +y).
+    NOT a hard-coded 'always-left' rule — the word is derived from THIS episode's target,
+    so different layouts yield different answers."""
+    tc = target_color(u)
+    same_ys = sorted(float(_pos(u.all_cubes[i])[1])
+                     for i in range(len(u.all_cubes)) if u.all_cube_colors[i] == tc)
+    ty = float(_pos(u.target_cubes[0])[1])
+    rank = min(range(len(same_ys)), key=lambda k: abs(same_ys[k] - ty))
+    n = len(same_ys)
+    if n == 2:
+        word = "left" if rank == 0 else "right"
+    elif n == 3:
+        word = ("left", "middle", "right")[rank]
+    else:
+        word = f"{rank + 1}-th from the left"
+    return f"first press the button, then pick up the {word} {tc} cube"
+
+
 # ------------------------------------------------------- per-episode controller
 
 class Controller:
@@ -207,10 +235,19 @@ class Controller:
             self._remembered = remembered
             self._plan = ([(args.utterance_step, "memory", remembered)]
                           if remembered else [])
+        elif self.c == "disambig_memory":
+            remembered = self.memory_store.get(t + "_disambig", {}).get(
+                str(getattr(env, "episode_id", "")), None)
+            self._remembered = remembered
+            self._plan = ([(args.utterance_step, "memory", remembered)]
+                          if remembered else [])
         else:
+            # disambig_guess (vague, never resolved) and disambig_ask (question in on_step)
             self._plan = []
 
     def initial_prompt(self) -> str:
+        if self.c in ("disambig_guess", "disambig_ask", "disambig_memory"):
+            return ambiguous_instruction(self.u)  # "pick up the blue cube" with 2 blues
         if self.c in ("reactive", "ask", "ask_memory") and self.task in VAGUE_PROMPTS:
             return VAGUE_PROMPTS[self.task]
         if self.c == "vague":
@@ -255,17 +292,29 @@ class Controller:
             print(f"[robot asks] step {step}: {question!r}")
             self._fire(step, "answer", answer)
 
+        # disambig_ask: ambiguity is known from the start -> ask at utterance_step,
+        # human disambiguates the same-colour cubes by position
+        if self.c == "disambig_ask" and step >= self.args.utterance_step \
+                and not getattr(self, "_asked", False):
+            self._asked = True
+            answer = disambig_answer(self.u)
+            question = f"which {target_color(self.u)} cube do you want?"
+            self.n_questions += 1
+            self.events.append({"step": int(step), "kind": "question", "text": question})
+            print(f"[robot asks] step {step}: {question!r}")
+            self._fire(step, "answer", answer)
+
     def current_prompt(self) -> str:
         return self._pending if self._pending is not None else self.initial_prompt()
 
     def episode_meta(self):
         meta = {"events": self.events, "n_questions": self.n_questions}
-        if self.c == "ask":
-            # persist the answer for the ask_memory pass
+        if self.c in ("ask", "disambig_ask"):
+            # persist the answer for the *_memory replay pass
             for e in self.events:
                 if e["kind"] == "answer":
                     meta["stored_answer"] = e["text"]
-        if self.c == "ask_memory":
+        if self.c in ("ask_memory", "disambig_memory"):
             meta["memory_hit"] = bool(getattr(self, "_remembered", None))
         if self.task == "MoveCube":
             meta["sampled_way"] = self.u.way
@@ -276,6 +325,9 @@ def episode_skip_reason(args: Args, u) -> str:
     """Referential-ambiguity screens (seed-determined => identical across conditions)."""
     if args.task != "PickHighlight":
         return ""
+    if args.condition.startswith("disambig"):
+        # Task 1 REQUIRES same-colour ambiguity -> keep only ambiguous episodes
+        return "" if not target_color_unique(u) else "skipped_unambiguous"
     if args.condition in ("update", "prohibition"):
         if not all_colors_unique(u):
             return "skipped_ambiguous"
@@ -397,7 +449,8 @@ def evaluate(args: Args):
     print(f"[interactive] {args.task}/{args.condition} candidates={candidates}")
 
     def n_valid():
-        return sum(1 for v in progress["episodes"].values() if v != "skipped_ambiguous")
+        return sum(1 for v in progress["episodes"].values()
+                   if not str(v).startswith("skipped_"))
 
     for ep in candidates:
         if n_valid() >= args.num_episodes:
@@ -418,14 +471,16 @@ def evaluate(args: Args):
         progress["meta"][str(ep)] = meta
         env_runner.close_env()
 
-        if args.condition == "ask" and meta.get("stored_answer"):
-            memory_store.setdefault(args.task, {})[str(ep)] = meta["stored_answer"]
+        if args.condition in ("ask", "disambig_ask") and meta.get("stored_answer"):
+            mem_key = args.task + ("_disambig" if args.condition == "disambig_ask" else "")
+            memory_store.setdefault(mem_key, {})[str(ep)] = meta["stored_answer"]
             memory_path.write_text(json.dumps(memory_store, indent=2))
 
         progress_path.write_text(json.dumps(progress, indent=2))
         print(f"[interactive] ep{ep} -> {flag}")
 
-    done = {k: v for k, v in progress["episodes"].items() if v != "skipped_ambiguous"}
+    done = {k: v for k, v in progress["episodes"].items()
+            if not str(v).startswith("skipped_")}
     n = len(done)
     succ = sum(1 for v in done.values() if v == "success")
     tout = sum(1 for v in done.values() if v == "timeout")
